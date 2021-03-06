@@ -7,9 +7,12 @@ package s3
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	aws_auth "github.com/dapr/components-contrib/authentication/aws"
 	"github.com/dapr/components-contrib/bindings"
@@ -19,9 +22,10 @@ import (
 
 // AWSS3 is a binding for an AWS S3 storage bucket
 type AWSS3 struct {
-	metadata *s3Metadata
-	uploader *s3manager.Uploader
-	logger   logger.Logger
+	metadata   *s3Metadata
+	uploader   *s3manager.Uploader
+	downloader *s3manager.Downloader
+	logger     logger.Logger
 }
 
 type s3Metadata struct {
@@ -44,18 +48,19 @@ func (s *AWSS3) Init(metadata bindings.Metadata) error {
 	if err != nil {
 		return err
 	}
-	uploader, err := s.getClient(m)
+	uploader, downloader, err := s.getClient(m)
 	if err != nil {
 		return err
 	}
 	s.metadata = m
 	s.uploader = uploader
+	s.downloader = downloader
 
 	return nil
 }
 
 func (s *AWSS3) Operations() []bindings.OperationKind {
-	return []bindings.OperationKind{bindings.CreateOperation}
+	return []bindings.OperationKind{bindings.CreateOperation, bindings.GetOperation}
 }
 
 func (s *AWSS3) Invoke(req *bindings.InvokeRequest) (*bindings.InvokeResponse, error) {
@@ -67,14 +72,50 @@ func (s *AWSS3) Invoke(req *bindings.InvokeRequest) (*bindings.InvokeResponse, e
 		s.logger.Debugf("key not found. generating key %s", key)
 	}
 
+	switch req.Operation {
+	case bindings.CreateOperation:
+		return s.create(key, req)
+	case bindings.GetOperation:
+		return s.get(key, req)
+	case bindings.DeleteOperation, bindings.ListOperation:
+		fallthrough
+	default:
+		return nil, fmt.Errorf("unsupported operation %s", req.Operation)
+	}
+}
+
+func (s *AWSS3) create(key string, req *bindings.InvokeRequest) (*bindings.InvokeResponse, error) {
 	r := bytes.NewReader(req.Data)
-	_, err := s.uploader.Upload(&s3manager.UploadInput{
+	output, err := s.uploader.Upload(&s3manager.UploadInput{
 		Bucket: aws.String(s.metadata.Bucket),
 		Key:    aws.String(key),
 		Body:   r,
 	})
 
-	return nil, err
+	b, err := json.Marshal(output)
+	if err != nil {
+		return nil, fmt.Errorf("error marshalling create response for s3 upload: %s", err)
+	}
+
+	return &bindings.InvokeResponse{
+		Data: b,
+	}, nil
+}
+
+func (s *AWSS3) get(key string, req *bindings.InvokeRequest) (*bindings.InvokeResponse, error) {
+	b := &aws.WriteAtBuffer{}
+	_, err := s.downloader.DownloadWithContext(context.Background(), b, &s3.GetObjectInput{
+		Bucket: aws.String(s.metadata.Bucket),
+		Key:    aws.String(key),
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("error downloading s3 object: %s", err)
+	}
+
+	return &bindings.InvokeResponse{
+		Data: b.Bytes(),
+	}, nil
 }
 
 func (s *AWSS3) parseMetadata(metadata bindings.Metadata) (*s3Metadata, error) {
@@ -92,13 +133,13 @@ func (s *AWSS3) parseMetadata(metadata bindings.Metadata) (*s3Metadata, error) {
 	return &m, nil
 }
 
-func (s *AWSS3) getClient(metadata *s3Metadata) (*s3manager.Uploader, error) {
+func (s *AWSS3) getClient(metadata *s3Metadata) (*s3manager.Uploader, *s3manager.Downloader, error) {
 	sess, err := aws_auth.GetClient(metadata.AccessKey, metadata.SecretKey, metadata.SessionToken, metadata.Region, metadata.Endpoint)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	uploader := s3manager.NewUploader(sess)
-
-	return uploader, nil
+	downloader := s3manager.NewDownloader(sess)
+	return uploader, downloader, nil
 }
